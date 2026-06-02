@@ -1,0 +1,9 @@
+## Interface: 120005
+## Title: GroupList
+## Author: Meiying
+## Version: 1.0
+## Notes: Affiche les membres du groupe
+## SavedVariables: GroupListDB
+
+GroupList.lua
+minimap.lua
