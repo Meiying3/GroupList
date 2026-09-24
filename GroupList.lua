@@ -6,16 +6,42 @@ function GetColumnEnabled(key)
     if GroupListDB and GroupListDB.columns and GroupListDB.columns[key] ~= nil then
         return GroupListDB.columns[key]
     end
+    -- Colonnes combat activees par defaut (temporaire pour tests)
+    if key == "dmg" or key == "heal" or key == "int" or key == "dtk" then
+        return true
+    end
     return true
 end
 
--- Largeur fixe du contenu (toutes colonnes visibles)
-local CONTENT_W   = 280
-local CONTENT_H   = 400
-local COL_ILV_X   = 155  -- position X colonne iLv
-local COL_SCR_X   = 205  -- position X colonne Score
-local COL_PAD     =   8  -- marge gauche texte
-local GRIP_SIZE   =  16  -- taille du grip
+-- Positions des colonnes
+local CONTENT_H    = 400
+local COL_NAME_END = 155  -- x ou commencent les colonnes optionnelles
+local COL_PAD      =   8  -- marge gauche texte
+local GRIP_SIZE    =  16  -- taille du grip
+
+-- Definition des colonnes optionnelles (ordre et largeur fixes)
+local COL_DEFS = {
+    { key = "ilv",   w = 50 },
+    { key = "score", w = 50 },
+    { key = "dmg",   w = 65 },
+    { key = "heal",  w = 65 },
+    { key = "int",   w = 65 },
+    { key = "dtk",   w = 75 },
+}
+
+-- Calcule les positions X de chaque colonne selon celles qui sont activees.
+-- Les colonnes desactivees sont sautees : les suivantes se serrent a gauche.
+-- La position stockee pour une colonne desactivee est celle qu'elle reprendrait si reactivee.
+local function ComputeColPositions()
+    local pos = {}
+    local x = COL_NAME_END
+    for _, col in ipairs(COL_DEFS) do
+        pos[col.key] = x
+        if GetColumnEnabled(col.key) then x = x + col.w end
+    end
+    pos._width = x
+    return pos
+end
 
 -- ─── Frame principale ─────────────────────────────────────
 local frame = CreateFrame("Frame", "GroupListFrame", UIParent, "BackdropTemplate")
@@ -82,18 +108,48 @@ grip:SetScript("OnMouseUp", function()
     frame:StopMovingOrSizing()
 end)
 
--- ─── Cache inspect ───────────────────────────────────────
-local ilvCache = {}          -- [guid] = ilv
+-- ─── Cache inspect + broadcast ──────────────────────────
+local ilvCache = {}          -- [guid] = ilv (calcule via inspect, approximatif)
+local broadcastCache = {}    -- [guid] = ilv (auto-reporte via addon message = valeur exacte)
 local inspectQueue = {}      -- liste de units a inspecter
 local inspectInProgress = false
+local inspectGeneration = 0
 local INSPECT_DELAY = 1.5    -- secondes entre chaque inspection
+local combatCleared = false  -- true = colonnes combat masquees jusqu'au prochain combat
+-- Forward declarations (definis dans la section communication plus bas)
+local BroadcastMyIlv
+local RequestGroupIlv
+
+
+local function FormatNum(n)
+    n = math.floor(n)
+    if n >= 1000000000 then return string.format("%.1fG", n / 1000000000)
+    elseif n >= 1000000 then return string.format("%.1fM", n / 1000000)
+    elseif n >= 1000    then return string.format("%.0fK", n / 1000)
+    else return tostring(n) end
+end
+
+local function FormatCombatCell(val, total)
+    if not val or val == 0 then return "-" end
+    local pct = total > 0 and math.floor(val / total * 100 + 0.5) or 0
+    return FormatNum(val) .. " " .. pct .. "%"
+end
+
+local function ComputeContentWidth()
+    return math.max(ComputeColPositions()._width + 10, COL_NAME_END + 50)
+end
 
 -- ─── Refresh manuel ──────────────────────────────────────
 local function ManualRefresh()
     ilvCache = {}
+    broadcastCache = {}
     inspectQueue = {}
     inspectInProgress = false
     UpdateGroupList()
+    C_Timer.After(0.5, function()
+        BroadcastMyIlv()
+        RequestGroupIlv()
+    end)
 end
 
 -- ─── Bouton reduire / agrandir ────────────────────────────
@@ -147,6 +203,60 @@ refreshBtn:SetScript("OnLeave", function()
     GameTooltip:Hide()
 end)
 
+-- Bouton poubelle (effacer donnees combat Details!)
+local trashBtn = CreateFrame("Button", nil, frame)
+trashBtn:SetSize(18, 18)
+trashBtn:SetPoint("TOPRIGHT", refreshBtn, "TOPLEFT", -2, 0)
+
+local trashTex = trashBtn:CreateTexture(nil, "ARTWORK")
+local trashHL  = trashBtn:CreateTexture(nil, "HIGHLIGHT")
+
+-- Cherche une icone poubelle dans l'atlas WoW
+local trashAtlasCandidates = {
+    "transmog-icon-remove",
+    "voidstorage-icon-deposit",
+    "crafting-icon-recraft",
+    "auctionhouse-icon-removeitem",
+}
+local trashAtlasFound = false
+for _, name in ipairs(trashAtlasCandidates) do
+    if C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(name) then
+        trashTex:SetAtlas(name, false)
+        trashTex:SetAllPoints(trashBtn)
+        trashTex:SetVertexColor(1, 0.85, 0)
+        trashHL:SetAtlas(name, false)
+        trashHL:SetAllPoints(trashBtn)
+        trashHL:SetVertexColor(1, 1, 0.5)
+        trashAtlasFound = true
+        break
+    end
+end
+if not trashAtlasFound then
+    -- Fallback : croix jaune, agrandie pour matcher visuellement le bouton refresh
+    trashTex:SetTexture("Interface/Buttons/UI-Panel-MinimizeButton-Up")
+    trashTex:SetSize(26, 26)
+    trashTex:SetPoint("CENTER", trashBtn, "CENTER")
+    trashTex:SetVertexColor(1, 0.85, 0)
+    trashHL:SetTexture("Interface/Buttons/UI-Panel-MinimizeButton-Up")
+    trashHL:SetSize(26, 26)
+    trashHL:SetPoint("CENTER", trashBtn, "CENTER")
+    trashHL:SetVertexColor(1, 1, 0.5)
+end
+
+trashBtn:SetScript("OnClick", function()
+    combatCleared = true
+    UpdateGroupList()
+end)
+
+trashBtn:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+    GameTooltip:SetText("Effacer les donnees de combat", 1, 1, 1)
+    GameTooltip:Show()
+end)
+trashBtn:SetScript("OnLeave", function()
+    GameTooltip:Hide()
+end)
+
 -- ─── ScrollFrame horizontal + vertical ────────────────────
 -- Container qui occupe toute la zone sous les en-tetes
 local scrollArea = CreateFrame("Frame", nil, frame)
@@ -182,7 +292,7 @@ hScroll:SetThumbTexture(hThumb)
 
 -- Content (largeur fixe = toutes colonnes)
 local content = CreateFrame("Frame", nil, vScroll)
-content:SetSize(CONTENT_W, CONTENT_H)
+content:SetSize(COL_NAME_END + 50, CONTENT_H)
 vScroll:SetScrollChild(content)
 
 -- Decalage horizontal du content selon slider
@@ -194,7 +304,7 @@ content:SetPoint("TOPLEFT", vScroll, "TOPLEFT", 0, 0)
 -- Met a jour la plage du slider horizontal quand la frame change de taille
 local function UpdateHScroll()
     local vw = vScroll:GetWidth()
-    local overflow = CONTENT_W - vw
+    local overflow = content:GetWidth() - vw
     if overflow > 0 then
         hScroll:SetMinMaxValues(0, overflow)
         hScroll:Show()
@@ -217,14 +327,28 @@ hdrName:SetText("Nom")
 hdrName:SetTextColor(0.7, 0.7, 0.7)
 
 local hdrIlv = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-hdrIlv:SetPoint("TOPLEFT", content, "TOPLEFT", COL_ILV_X, -2)
 hdrIlv:SetText("iLv")
 hdrIlv:SetTextColor(0.7, 0.7, 0.7)
 
 local hdrScore = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-hdrScore:SetPoint("TOPLEFT", content, "TOPLEFT", COL_SCR_X, -2)
 hdrScore:SetText("Cote M+")
 hdrScore:SetTextColor(0.7, 0.7, 0.7)
+
+local hdrDmg = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+hdrDmg:SetText("Dmg")
+hdrDmg:SetTextColor(1.0, 0.5, 0.3)
+
+local hdrHeal = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+hdrHeal:SetText("Soins")
+hdrHeal:SetTextColor(0.3, 1.0, 0.3)
+
+local hdrInt = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+hdrInt:SetText("Int")
+hdrInt:SetTextColor(0.3, 0.7, 1.0)
+
+local hdrDtk = content:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+hdrDtk:SetText("DmgSub")
+hdrDtk:SetTextColor(1.0, 0.3, 0.3)
 
 -- ─── Cache iLv par GUID ──────────────────────────────────
 
@@ -232,18 +356,19 @@ local function GetSlotIlv(unit, slot)
     local link = GetInventoryItemLink(unit, slot)
     if not link then return nil end
 
-    -- Methode 1 : iLv effectif depuis le lien (inclut upgrades crests) — Midnight 12.x
+    -- Methode 1 : iLv effectif depuis le lien (bonus IDs — crests, crafted)
     if C_Item and C_Item.GetDetailedItemLevelInfo then
         local ilvl = C_Item.GetDetailedItemLevelInfo(link)
         if ilvl and ilvl > 0 then return ilvl end
     end
 
-    -- Methode 2 : tooltip structure C_TooltipInfo (fonctionne pour les joueurs inspectes)
-    if C_TooltipInfo and C_TooltipInfo.GetInventoryItem then
-        local data = C_TooltipInfo.GetInventoryItem(unit, slot)
+    -- Methode 2 : tooltip depuis le lien (independant du unit/slot, lit les bonus IDs)
+    -- NB: GetInventoryItem(unit, slot) ne fonctionne pas pour les joueurs inspectes sur Midnight
+    if C_TooltipInfo and C_TooltipInfo.GetHyperlink then
+        local data = C_TooltipInfo.GetHyperlink(link)
         if data and data.lines then
             for _, line in ipairs(data.lines) do
-                if line.type == Enum.TooltipDataLineType.ItemLevel and line.itemLevel then
+                if line.itemLevel and line.itemLevel > 0 then
                     return line.itemLevel
                 end
             end
@@ -287,24 +412,27 @@ local function ProcessInspectQueue()
     inspectInProgress = true
     local unit = table.remove(inspectQueue, 1)
     if UnitExists(unit) and UnitIsConnected(unit) then
-        if CheckInteractDistance(unit, 1) then
-            ClearInspectPlayer()
-            NotifyInspect(unit)
-        else
-            -- Hors de portee : remettre en fin de file et reessayer
-            table.insert(inspectQueue, unit)
-            C_Timer.After(2, ProcessInspectQueue)
-        end
+        inspectGeneration = inspectGeneration + 1
+        local gen = inspectGeneration
+        ClearInspectPlayer()
+        NotifyInspect(unit)
+        -- Si INSPECT_READY ne se declenche pas (hors portee, etc.), avancer la file
+        C_Timer.After(5, function()
+            if gen == inspectGeneration then
+                ProcessInspectQueue()
+            end
+        end)
     else
         -- Joueur deconnecte ou inexistant : passer au suivant
         C_Timer.After(INSPECT_DELAY, ProcessInspectQueue)
     end
 end
 
--- Quand l'inspection est prete, on lit les slots
+-- Quand l'inspection est prete, on lit l'iLv
 local inspectFrame = CreateFrame("Frame")
 inspectFrame:RegisterEvent("INSPECT_READY")
 inspectFrame:SetScript("OnEvent", function(self, event, guid)
+    inspectGeneration = inspectGeneration + 1
     -- Chercher l'unit correspondant au GUID
     local unit = nil
     local unitType = IsInRaid() and "raid" or "party"
@@ -317,11 +445,20 @@ inspectFrame:SetScript("OnEvent", function(self, event, guid)
         end
     end
     if unit then
-        -- Attendre 0.5s que WoW finisse de recevoir tous les slots avant de lire
         local capturedUnit = unit
         local capturedGuid = guid
         C_Timer.After(0.5, function()
-            local ilv = CalcIlvFromSlots(capturedUnit)
+            -- C_PaperDollInfo.GetInspectItemLevel retourne l'iLv exact (upgrades inclus),
+            -- equivalent de GetAverageItemLevel() pour le joueur local
+            local ilv
+            if C_PaperDollInfo and C_PaperDollInfo.GetInspectItemLevel then
+                local v = C_PaperDollInfo.GetInspectItemLevel(capturedUnit)
+                if v and v > 0 then ilv = math.floor(v) end
+            end
+            -- Fallback si l'API n'est pas disponible
+            if not ilv then
+                ilv = CalcIlvFromSlots(capturedUnit)
+            end
             if ilv then
                 ilvCache[capturedGuid] = ilv
                 UpdateGroupList()
@@ -346,7 +483,7 @@ end
 
 -- ─── API iLv ──────────────────────────────────────────────
 local function GetUnitItemLevel(unit)
-    -- Joueur local : API native
+    -- Joueur local : API native (toujours exact)
     if UnitIsUnit(unit, "player") then
         local _, equipped = GetAverageItemLevel()
         if equipped and equipped > 0 then return math.floor(equipped) end
@@ -354,12 +491,17 @@ local function GetUnitItemLevel(unit)
 
     local guid = UnitGUID(unit)
 
-    -- Cache disponible
+    -- Broadcast addon (iLv exact auto-reporte par le membre lui-meme)
+    if guid and broadcastCache[guid] then
+        return broadcastCache[guid]
+    end
+
+    -- Cache inspect (approximatif — iLv base si le membre n'a pas l'addon)
     if guid and ilvCache[guid] then
         return ilvCache[guid]
     end
 
-    -- Lancer une inspection asynchrone (seul moyen fiable pour les autres joueurs)
+    -- Lancer une inspection asynchrone
     QueueInspect(unit)
     return nil
 end
@@ -418,8 +560,25 @@ end
 local nameLabels  = {}
 local ilvLabels   = {}
 local scoreLabels = {}
+local dmgLabels   = {}
+local healLabels  = {}
+local intLabels   = {}
+local dtkLabels   = {}
 local ROW_H = 16
 local ROW_START = -18  -- offset Y apres l'en-tete
+
+-- Details! indexe les acteurs distants avec le suffixe "-Royaume" (nom
+-- source du combat log) alors que UnitName() renvoie le nom seul pour les
+-- membres du groupe sur un autre royaume connecte. On tente donc les deux.
+local function GetDetailsActor(dc, container, m)
+    if not dc then return nil end
+    local a = dc:GetActor(container, m.name)
+    if a then return a end
+    if m.realm then
+        return dc:GetActor(container, m.name .. "-" .. m.realm)
+    end
+    return nil
+end
 
 function UpdateGroupList()  -- global (appele depuis minimap.lua et ManualRefresh)
     if collapsed then return end
@@ -428,6 +587,10 @@ function UpdateGroupList()  -- global (appele depuis minimap.lua et ManualRefres
         nameLabels[i]:Hide()
         ilvLabels[i]:Hide()
         if scoreLabels[i] then scoreLabels[i]:Hide() end
+        if dmgLabels[i]   then dmgLabels[i]:Hide()   end
+        if healLabels[i]  then healLabels[i]:Hide()  end
+        if intLabels[i]   then intLabels[i]:Hide()   end
+        if dtkLabels[i]   then dtkLabels[i]:Hide()   end
     end
 
     local members = {}
@@ -442,22 +605,72 @@ function UpdateGroupList()  -- global (appele depuis minimap.lua et ManualRefres
         end
         for i = 1, count do
             local u    = unit..i
-            local name = (UnitName(u))
-            if name then tinsert(members, { name = name, unit = u }) end
+            local name, realm = UnitName(u)
+            if name then
+                tinsert(members, { name = name, realm = (realm ~= "" and realm) or nil, unit = u })
+            end
         end
     end
 
-    -- Adapter la hauteur du content au nombre de membres
+    -- Adapter la hauteur + largeur du content
     content:SetHeight(math.max(CONTENT_H, ROW_H * (#members + 1) + 4))
+    local colPos = ComputeColPositions()
+    content:SetWidth(math.max(colPos._width + 10, COL_NAME_END + 50))
+
+    -- Repositionner les en-tetes selon les colonnes activees
+    hdrIlv:ClearAllPoints()
+    hdrIlv:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["ilv"], -2)
+    hdrIlv:SetShown(GetColumnEnabled("ilv"))
+    hdrScore:ClearAllPoints()
+    hdrScore:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["score"], -2)
+    hdrScore:SetShown(GetColumnEnabled("score"))
+    hdrDmg:ClearAllPoints()
+    hdrDmg:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["dmg"], -2)
+    hdrDmg:SetShown(GetColumnEnabled("dmg"))
+    hdrHeal:ClearAllPoints()
+    hdrHeal:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["heal"], -2)
+    hdrHeal:SetShown(GetColumnEnabled("heal"))
+    hdrInt:ClearAllPoints()
+    hdrInt:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["int"], -2)
+    hdrInt:SetShown(GetColumnEnabled("int"))
+    hdrDtk:ClearAllPoints()
+    hdrDtk:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["dtk"], -2)
+    hdrDtk:SetShown(GetColumnEnabled("dtk"))
+
+    -- Donnees Details! : container 1 = degats, container 2 = soins, container 4 = misc (interruptions)
+    local dc = (not combatCleared) and Details and Details:GetCurrentCombat() or nil
+    local totalDmg  = dc and dc:GetTotal(1) or 0
+    local totalHeal = dc and dc:GetTotal(2) or 0
+    local totalDtk  = 0
+    local totalInt  = 0
+    if dc then
+        for _, m in ipairs(members) do
+            local a1 = GetDetailsActor(dc, 1, m)
+            local a4 = GetDetailsActor(dc, 4, m)
+            if a1 then totalDtk = totalDtk + (a1.damage_taken or 0) end
+            if a4 then totalInt = totalInt + math.floor(a4.interrupt or 0) end
+        end
+    end
+
+    local showIlv  = GetColumnEnabled("ilv")
+    local showScr  = GetColumnEnabled("score")
+    local showDmg  = GetColumnEnabled("dmg")
+    local showHeal = GetColumnEnabled("heal")
+    local showInt  = GetColumnEnabled("int")
+    local showDtk  = GetColumnEnabled("dtk")
 
     for i, m in ipairs(members) do
         local yOff = ROW_START - (i-1) * ROW_H
+        local guid = UnitGUID(m.unit)
+        local da1  = GetDetailsActor(dc, 1, m)
+        local da2  = GetDetailsActor(dc, 2, m)
+        local da4  = GetDetailsActor(dc, 4, m)
 
         -- Nom
         local nl = nameLabels[i]
         if not nl then
             nl = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-            nl:SetWidth(COL_ILV_X - COL_PAD - 4)
+            nl:SetWidth(COL_NAME_END - COL_PAD - 4)
             nl:SetJustifyH("LEFT")
             nl:SetNonSpaceWrap(false)
             nameLabels[i] = nl
@@ -474,12 +687,12 @@ function UpdateGroupList()  -- global (appele depuis minimap.lua et ManualRefres
             ilvLabels[i] = il
         end
         il:ClearAllPoints()
-        il:SetPoint("TOPLEFT", content, "TOPLEFT", COL_ILV_X, yOff)
+        il:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["ilv"], yOff)
         local ilv = GetUnitItemLevel(m.unit)
         local r, g, b = IlvColor(ilv)
         il:SetTextColor(r, g, b)
         il:SetText(ilv and tostring(ilv) or "?")
-        il:SetShown(GetColumnEnabled("ilv"))
+        il:SetShown(showIlv)
 
         -- Score M+
         local sl = scoreLabels[i]
@@ -488,18 +701,65 @@ function UpdateGroupList()  -- global (appele depuis minimap.lua et ManualRefres
             scoreLabels[i] = sl
         end
         sl:ClearAllPoints()
-        sl:SetPoint("TOPLEFT", content, "TOPLEFT", COL_SCR_X, yOff)
+        sl:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["score"], yOff)
         local score = GetUnitMythicScore(m.unit)
         local sr, sg, sb = ScoreColor(score)
         sl:SetTextColor(sr, sg, sb)
         sl:SetText(score and tostring(score) or "-")
-        sl:SetShown(GetColumnEnabled("score"))
-    end
+        sl:SetShown(showScr)
 
-    hdrIlv:SetShown(GetColumnEnabled("ilv"))
-    hdrScore:SetShown(GetColumnEnabled("score"))
+        -- Degats
+        local dl = dmgLabels[i]
+        if not dl then
+            dl = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            dmgLabels[i] = dl
+        end
+        dl:ClearAllPoints()
+        dl:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["dmg"], yOff)
+        dl:SetTextColor(1.0, 0.6, 0.3)
+        dl:SetText(FormatCombatCell(da1 and da1.total, totalDmg))
+        dl:SetShown(showDmg)
+
+        -- Soins
+        local hl = healLabels[i]
+        if not hl then
+            hl = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            healLabels[i] = hl
+        end
+        hl:ClearAllPoints()
+        hl:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["heal"], yOff)
+        hl:SetTextColor(0.3, 1.0, 0.3)
+        hl:SetText(FormatCombatCell(da2 and da2.total, totalHeal))
+        hl:SetShown(showHeal)
+
+        -- Interruptions
+        local xl = intLabels[i]
+        if not xl then
+            xl = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            intLabels[i] = xl
+        end
+        xl:ClearAllPoints()
+        xl:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["int"], yOff)
+        xl:SetTextColor(0.4, 0.8, 1.0)
+        local intVal = da4 and math.floor(da4.interrupt or 0) or 0
+        xl:SetText(FormatCombatCell(intVal > 0 and intVal or nil, totalInt))
+        xl:SetShown(showInt)
+
+        -- Degats subis
+        local tkl = dtkLabels[i]
+        if not tkl then
+            tkl = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            dtkLabels[i] = tkl
+        end
+        tkl:ClearAllPoints()
+        tkl:SetPoint("TOPLEFT", content, "TOPLEFT", colPos["dtk"], yOff)
+        tkl:SetTextColor(1.0, 0.3, 0.3)
+        tkl:SetText(FormatCombatCell(da1 and da1.damage_taken, totalDtk))
+        tkl:SetShown(showDtk)
+    end
     UpdateHScroll()
 end
+
 
 -- ─── Cache items ──────────────────────────────────────────
 local refreshPending = false
@@ -547,7 +807,7 @@ end
 frame:HookScript("OnDragStop", SaveLayout)
 grip:HookScript("OnMouseUp",   SaveLayout)
 
--- Commande slash /gl refresh
+-- Commande slash /gl
 SLASH_GROUPLIST1 = "/gl"
 SlashCmdList["GROUPLIST"] = function(msg)
     local cmd = msg:lower()
@@ -569,61 +829,63 @@ SlashCmdList["GROUPLIST"] = function(msg)
 end
 
 -- ─── Communication addon (partage iLv entre membres) ─────
+-- Format message : "ILV:<ilv>:<guid>"  →  iLv exact auto-reporte
+--                  "REQ_ILV"           →  demande de re-broadcast
 local ADDON_PREFIX = "GroupList"
 C_ChatInfo.RegisterAddonMessagePrefix(ADDON_PREFIX)
 
-local function BroadcastMyIlv()
-    -- Envoyer son propre iLv exact au groupe
+BroadcastMyIlv = function()
     local _, equipped = GetAverageItemLevel()
     if not equipped or equipped <= 0 then return end
     local ilv = math.floor(equipped)
+    local guid = UnitGUID("player")
     local channel = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or nil)
     if channel then
-        C_ChatInfo.SendAddonMessage(ADDON_PREFIX, "ILV:"..ilv, channel)
+        C_ChatInfo.SendAddonMessage(ADDON_PREFIX, "ILV:" .. ilv .. ":" .. guid, channel)
     end
 end
 
--- Frame de reception des messages addon
+RequestGroupIlv = function()
+    local channel = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or nil)
+    if channel then
+        C_ChatInfo.SendAddonMessage(ADDON_PREFIX, "REQ_ILV", channel)
+    end
+end
+
 local commsFrame = CreateFrame("Frame")
 commsFrame:RegisterEvent("CHAT_MSG_ADDON")
-commsFrame:SetScript("OnEvent", function(self, event, prefix, message, channel, sender)
+commsFrame:SetScript("OnEvent", function(self, event, prefix, message)
     if prefix ~= ADDON_PREFIX then return end
-    local ilv = message:match("^ILV:(%d+)$")
-    if ilv then
-        -- Trouver le GUID du sender et mettre en cache
-        local unitType = IsInRaid() and "raid" or "party"
-        local count = GetNumGroupMembers()
-        for i = 1, count do
-            local unit = unitType..i
-            local name = (UnitName(unit))
-            -- Comparer le nom (sender peut etre "Nom-Royaume")
-            local senderName = sender:match("^([^%-]+)")
-            if name and (name == sender or name == senderName) then
-                local guid = UnitGUID(unit)
-                if guid then
-                    ilvCache[guid] = tonumber(ilv)
-                    UpdateGroupList()
-                end
-                break
-            end
-        end
+    if message == "REQ_ILV" then
+        -- Un membre demande les iLv : repondre avec un leger delai aleatoire pour eviter les floods
+        C_Timer.After(math.random() * 2, BroadcastMyIlv)
+        return
+    end
+    local ilv, senderGuid = message:match("^ILV:(%d+):(.+)$")
+    if ilv and senderGuid then
+        broadcastCache[senderGuid] = tonumber(ilv)
+        UpdateGroupList()
     end
 end)
 
 -- ─── Evenements ───────────────────────────────────────────
 frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("GROUP_ROSTER_UPDATE")
-frame:RegisterEvent("UNIT_CONNECTION")          -- joueur se connecte/deconnecte
-frame:RegisterEvent("PLAYER_ENTERING_WORLD")    -- apres chargement de zone
+frame:RegisterEvent("UNIT_CONNECTION")
+frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
 frame:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 frame:SetScript("OnEvent", function(self, event)
     if event == "PLAYER_LOGIN" then
         RestoreLayout()
         UpdateGroupList()
-        C_Timer.After(2, BroadcastMyIlv)  -- laisser le temps au groupe de charger
+        C_Timer.After(2, function()
+            BroadcastMyIlv()
+            RequestGroupIlv()
+        end)
     elseif event == "PLAYER_EQUIPMENT_CHANGED" then
-        C_Timer.After(1, BroadcastMyIlv)  -- partager le nouvel iLv apres changement
+        C_Timer.After(1, BroadcastMyIlv)
         C_Timer.After(1.3, function() UpdateGroupList() end)
     elseif event == "GET_ITEM_INFO_RECEIVED" then
         refreshPending = true
@@ -633,11 +895,13 @@ frame:SetScript("OnEvent", function(self, event)
         ilvCache = {}
         C_Timer.After(0.5, function()
             UpdateGroupList()
-            BroadcastMyIlv()  -- re-broadcaster quand le groupe change
+            BroadcastMyIlv()
+            RequestGroupIlv()
         end)
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        combatCleared = false
+        C_Timer.After(0.5, function() UpdateGroupList() end)
     else
-        C_Timer.After(0.3, function()
-            UpdateGroupList()
-        end)
+        C_Timer.After(0.3, function() UpdateGroupList() end)
     end
 end)
